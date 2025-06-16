@@ -1,0 +1,109 @@
+name: PR Review Bot
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  review-pr:
+    runs-on: self-hosted
+    name: PRBot Review with Granite
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.11
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Review changed files with Granite
+        run: |
+          import os
+          import subprocess
+          import requests
+          import json
+
+          GITHUB_TOKEN = os.getenv('GITHUB_TOKEN')
+          PR_NUMBER = os.getenv('PR_NUMBER')
+          REPO = os.getenv('GITHUB_REPOSITORY')
+          HEAD_SHA = os.getenv('GITHUB_SHA')
+
+          headers = {
+              "Authorization": f"Bearer {GITHUB_TOKEN}",
+              "Accept": "application/vnd.github.v3+json"
+          }
+
+          # Get list of changed files
+          result = subprocess.run(
+              ["git", "diff", "--name-only", "origin/main...HEAD"],
+              stdout=subprocess.PIPE,
+              text=True,
+              check=True
+          )
+          files = result.stdout.strip().splitlines()
+
+          comments = []
+
+          for filename in files:
+              if not os.path.isfile(filename):
+                  continue  # skip deleted or moved files
+
+              try:
+                  with open(filename, "r") as f:
+                      file_content = f.read()
+              except Exception as e:
+                  print(f"Error reading file {filename}: {e}")
+                  continue
+
+              # Get the diff
+              result = subprocess.run(
+                  ["git", "diff", "-U100", f"origin/main...HEAD", "--", filename],
+                  stdout=subprocess.PIPE,
+                  text=True,
+                  check=True
+              )
+              diff = result.stdout
+
+              # Trim long content
+              token_limit = 16000  # approx 4K tokens
+              input_text = f"File: {filename}\n\n{file_content}\n\nChanges:\n{diff}"
+              if len(input_text) > token_limit:
+                  input_text = f"File: {filename}\n\nChanges (with context):\n{diff}"
+
+              # Call Granite model
+              try:
+                  response = requests.post(
+                      "http://localhost:11434/api/generate",
+                      json={
+                          "model": "granite",
+                          "prompt": f"Act like a code reviewer and give constructive feedback for this pull request:\n\n{input_text}"
+                      },
+                      timeout=60
+                  )
+                  response.raise_for_status()
+                  result = response.json()
+                  comments.append(f"**Review for `{filename}`**\n\n{result.get('response', 'No response from model.')}")
+              except Exception as e:
+                  comments.append(f"⚠️ Error reviewing `{filename}`: {str(e)}")
+
+          # Post comment to PR
+          if comments:
+              body = "\n\n---\n\n".join(comments)
+              comment_url = f"https://api.github.com/repos/{REPO}/issues/{PR_NUMBER}/comments"
+              post = requests.post(
+                  comment_url,
+                  headers=headers,
+                  json={"body": body}
+              )
+              post.raise_for_status()
+              print("Comment posted!")
+          else:
+              print("No comments generated.")
+
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
